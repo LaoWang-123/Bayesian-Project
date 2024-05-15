@@ -1,0 +1,274 @@
+---
+title: "Final Project"
+author: "Liangkang Wang"
+format: pdf
+editor: visual
+---
+
+#### Bayesian analysis of atelectasis.
+
+## Missing data
+
+```{r}
+
+library(tidyverse)
+ate_data <- read.csv("atelectasis_prevalence.csv")
+
+### NA checking
+na_percentage_df <- ate_data %>%
+  summarise(across(everything(), ~ sum(is.na(.)) / n() * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "NA_Percentage")
+
+#### missing heatmap
+missing_heatmap <- function(data,title){
+  missing_values <- is.na(data)
+
+# Melt the matrix for use with ggplot
+missing_melted <- reshape2::melt(missing_values,
+                                 id.vars = rownames(missing_values))
+
+# Create the heatmap
+g <- ggplot2::ggplot(missing_melted, aes(x = Var2, y = Var1)) +
+  geom_tile(aes(fill = value)) +
+  scale_fill_manual(name = "", labels = c("Present", "Missing"),
+                    values = c("black", "red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Variables", y = "Observations",title = title)+
+  theme(plot.title = element_text(hjust = 0.5))
+return(g)
+}
+
+
+missing_heatmap(data = filted_data,title = "Missing Heatmap")+ theme(
+  legend.position = "none",
+  axis.text.x = element_blank(),
+  axis.title.x = element_blank(),
+  # axis.text.y = element_blank(),
+  axis.title.y = element_blank()
+)
+
+filted_data <- ate_data %>% select(-c(ID,atelectasis_location,PCR_covid,altitude,state_residence,mon_absolute,mon_percent,ARISCAT,atelectasis_percent,ARISCAT_group,ASA,CORADS))
+
+```
+
+Deal with the missing data problem.
+
+atelectasis_location has 66.66% missing rate, PCR_covid has 98.7% missing rate. We removed this two columns. There are 5 patients have missing value in some columns. However, from previous study we know these missing values are not important in our study because those measure don't have a significant impact in the prevalence of atelectasis. So we retained them, and finally we have 245 observations.
+
+## Summary table
+
+```{r}
+# Install and load the gtsummary package
+if (!require(gtsummary)) install.packages("gtsummary")
+library(gtsummary)
+if (!require(kableExtra)) install.packages("kableExtra")
+library(kableExtra)
+
+# Create a table summarizing the data grouped by type_obesity
+table <- tbl_summary(
+  filted_data,
+  by = type_obesity, # group by type of obesity
+  statistic = list(
+    all_continuous() ~ "{median} [{p25}, {p75}]",
+    all_categorical() ~ "{n} ({p}%)"
+  ),
+  digits = all_continuous() ~ 2
+)
+
+# Print the table
+plot_object <- as_ggplot(table)
+
+png("gtsummary_table.png", width = 800, height = 600)
+
+
+save_kable <- function(x, file = "table.html") {
+  html <- as_kable(x, format = "html") %>% 
+    kableExtra::kable_styling(full_width = F, position = "left") %>%
+    as.character() %>%
+    paste(collapse = "\n")
+  
+  writeLines(html, con = file)
+}
+
+save_kable(table)
+
+```
+
+### frequentist logistic regression
+
+```{r}
+
+regression_data <- ate_data %>% select(age,sex,BMI,atelectasis,sleep_apnea) %>% mutate(obesity_type)
+breaks <- c(30, 35, 40, 45, 50, Inf)  # Inf for values >= 50
+regression_data$obesity_type <- cut(regression_data$BMI, 
+                         breaks = breaks,
+                         labels = c("30-35", "35-40", "40-45", "45-50", ">=50"),
+                         include.lowest = TRUE,  # Include the lowest value in the first interval
+                         right = FALSE)  # This makes the intervals closed on the left and open on the right
+
+freq_logistic <- glm(atelectasis ~ BMI+age+sex+sleep_apnea, data = regression_data, family = binomial())
+
+
+```
+
+### bayesian logistic regression
+```{r}
+# Load required library
+if (!require("rstan")) {
+  install.packages("rstan")
+  library(rstan)
+}
+
+# Stan model code
+stan_code <- 'data {
+  int<lower=0> N;  // number of observations
+  int<lower=0, upper=1> Y[N];  // outcome variable
+  vector[N] BMI;
+  vector[N] Age;
+  vector[N] Sex;
+  vector[N] OSA;
+}
+parameters {
+  real beta0;
+  real beta1;
+  real beta2;
+  real beta3;
+  real beta4;
+}
+model {
+  // Prior distributions
+  beta0 ~ normal(0, 10);
+  beta1 ~ normal(0, 10);
+  beta2 ~ normal(0, 10);
+  beta3 ~ normal(0, 10);
+  beta4 ~ normal(0, 10);
+
+  // Logistic regression
+  for (i in 1:N) {
+    Y[i] ~ bernoulli_logit(beta0 + beta1 * BMI[i] + beta2 * Age[i] + beta3 * Sex[i] + beta4 * OSA[i]);
+  }
+}'
+# Prepare data for Stan model
+data_list <- list(
+  N = nrow(regression_data),
+  Y = regression_data$atelectasis,
+  BMI = regression_data$BMI,
+  Age = regression_data$age,
+  Sex = regression_data$sex,
+  OSA = regression_data$sleep_apnea
+)
+
+# Fit the model
+fit <- stan(model_code = stan_code, data = data_list, iter = 4000, chains = 4,warmup = 2000)
+
+# Print the results
+print(fit)
+
+```
+### prevalence predicted
+
+```{r}
+# Extract parameter samples
+param_samples <- as.data.frame(extract(fit))
+
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Randomly select 300 parameter sets
+sample_indices <- sample(1:nrow(param_samples), 300, replace = TRUE)
+selected_samples <- param_samples[sample_indices, ]
+
+# Generate predictions for each selected sample set
+predicted_probs <- apply(selected_samples, 1, function(params) {
+  beta0 <- params['beta0']
+  beta1 <- params['beta1']
+  beta2 <- params['beta2']
+  beta3 <- params['beta3']
+  beta4 <- params['beta4']
+
+  # Calculate logistic function
+  p <- 1 / (1 + exp(-(beta0 + beta1 * regression_data$BMI + beta2 * regression_data$age +
+                      beta3 * regression_data$sex + beta4 * regression_data$sleep_apnea)))
+  return(p)
+})
+
+# Convert the matrix to have probabilities as columns for each observation
+colnames(predicted_probs) <- 1:300
+
+posterior_output <- cbind(regression_data,predicted_probs)
+
+```
+
+```{r}
+unique(posterior_output$obesity_type)
+
+mean_ci <- function(A,a=0.025,b=0.975){
+  A.mean=mean(A)
+  A.quantile=quantile(A,c(a,b))
+  return(c(A.mean,A.quantile))
+}
+
+### 30-35
+type1 <- posterior_output[posterior_output$obesity_type=="30-35",7:306]
+
+### 35-40
+type2 <- posterior_output[posterior_output$obesity_type=="35-40",7:306]
+
+### 40-45
+type3 <- posterior_output[posterior_output$obesity_type=="40-45",7:306]
+
+### 45-50
+type4 <- posterior_output[posterior_output$obesity_type=="45-50",7:306]
+
+### 50
+type5 <- posterior_output[posterior_output$obesity_type==">=50",7:306]
+
+
+mean_ci(unlist(type1))
+mean_ci(unlist(type2))
+mean_ci(unlist(type3))
+mean_ci(unlist(type4))
+mean_ci(unlist(type5))
+
+```
+
+
+
+### MCMC convergence checking 
+
+```{r}
+if (!require("bayesplot")) {
+  install.packages("bayesplot")
+}
+library(bayesplot)
+library(rstan)  # assuming it's already installed and loaded
+
+# Assuming 'fit' is your fitted Stan model
+color_scheme_set("blue")  # Set color scheme, optional
+
+# Generate trace plots for all parameters
+trace_plots <- mcmc_trace(fit, pars = c("beta0", "beta1", "beta2", "beta3", "beta4"))
+
+# Plotting
+print(trace_plots)
+
+```
+### Autocorrelation check
+
+```{r}
+# Check autocorrelation for each parameter
+auto_corr_plots <- mcmc_acf(fit, pars = c("beta0", "beta1", "beta2", "beta3", "beta4"))
+print(auto_corr_plots)
+
+```
+```{r}
+# Summary of the fit to check R-hat and Effective Sample Size
+summary_info <- summary(fit)
+print(summary_info$summary)
+
+```
+
+
+
